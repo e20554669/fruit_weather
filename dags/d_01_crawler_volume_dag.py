@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import pymysql
 from airflow import DAG
 from airflow.decorators import task
+import pendulum
 
 # MySQL 連線設定
 DB_CONFIG = {
@@ -135,10 +136,10 @@ def insert_to_mysql(df):
 
 # Airflow DAG
 with DAG(
-    dag_id="fruit_price_daily",
+    dag_id="d_01_crawler_volume_dag",
     description="每日抓取台灣水果行情（API）",
-    start_date=datetime(2020, 1, 1),
-    schedule="36 16 * * *",
+    start_date=pendulum.datetime(2020, 1, 1, tz="Asia/Taipei"),
+    schedule="50 15 * * *",
     catchup=False,
     tags=["fruit", "moa", "mysql"]
 ) as dag:
