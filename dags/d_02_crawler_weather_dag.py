@@ -860,7 +860,8 @@ def create_daily_summary(hourly_df):
     sum_cols = ["Precipitation", "PrecipitationDuration", "SunshineDuration"]
     max_cols = ["PeakGust", "is_typhoon"]
 
-    group_cols = ["Date", "city_id", "city_name", "Altitude"]
+    # 建立分組欄位
+    group_cols = ["Date", "city_id", "city_name", "station_id", "Altitude"]
 
     agg_dict = {}
     all_targets = mean_cols + sum_cols + max_cols
@@ -873,16 +874,36 @@ def create_daily_summary(hourly_df):
             x.dropna().iloc[0] if len(x.dropna()) > 0 else ""
         )
 
+    # 將每個欄位賦予聚合函數
     for col in all_targets:
-        if col in hourly_df.columns and col not in group_cols:
-            if col in mean_cols:
-                agg_dict[col] = "mean"
-            elif col in sum_cols:
-                agg_dict[col] = "sum"
-            elif col in max_cols:
-                agg_dict[col] = "max"
+        if col in hourly_df.columns:
+            if col in mean_cols: agg_dict[col] = "mean"
+            elif col in sum_cols: agg_dict[col] = "sum"
+            elif col in max_cols: agg_dict[col] = "max"
 
+    # 第一次分組
     daily_df = hourly_df.groupby(group_cols).agg(agg_dict).reset_index()
+
+    # 移除 station_id，準備進行第二次合併
+    daily_df = daily_df.drop(columns=["station_id"])
+    group_cols.remove("station_id")
+
+    agg_dict = {}  # 重新初始化聚合用字典 
+    numeric_cols = mean_cols + sum_cols + max_cols  # 建立一個清單用以存放數值欄位
+    for col in numeric_cols:
+        if col in daily_df.columns and col not in group_cols:
+            # 第二階段全部用平均 (Mean)
+            agg_dict[col] = "mean"
+
+    # 風向和颱風名稱依舊特殊處理 (取眾數或第一個)
+    if "WindDirection" in daily_df.columns:
+         agg_dict["WindDirection"] = lambda x: x.mode()[0] if len(x.mode()) > 0 else x.mean()
+    if "typhoon_name" in daily_df.columns:
+         agg_dict["typhoon_name"] = lambda x: x.dropna().iloc[0] if len(x.dropna()) > 0 else ""
+
+    # 第二次分組
+    daily_df = daily_df.groupby(group_cols).agg(agg_dict).reset_index()
+
     daily_df["Date"] = daily_df["Date"].astype(str)
 
     for col in daily_df.select_dtypes(include=["float64"]).columns:
@@ -894,14 +915,11 @@ def create_daily_summary(hourly_df):
 
     return daily_df
 
-
 def camel_to_snake(name):
     s1 = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", name)
     return re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
-
 #  開始處理 Airflow DAG
-
 
 @dag(
     dag_id="d_02_crawler_weather_dag",
@@ -910,6 +928,7 @@ def camel_to_snake(name):
     start_date=pendulum.datetime(2020, 1, 1, tz="Asia/Taipei"),
     catchup=False,
     tags=["weather", "etl", "mysql", "pymysql"],
+    is_paused_upon_creation=False,
 )
 def weather_etl_dag_pymysql():
 
@@ -917,38 +936,50 @@ def weather_etl_dag_pymysql():
     def extract_weather_data():
         """extract"""
         print("--- [Task 1] Extract: 開始抓取氣象資料 ---")
-        target_date = datetime.today().date() - timedelta(days=3)  # 設定3天避免API掛點
-        print(f"目標日期: {target_date}")
+        st = datetime.today().date() - timedelta(days=3)
+        et = datetime.today().date() - timedelta(days=1)
+        print(f"抓取範圍: {st}~{et}")
+
+        # 產生日期列表
+        dates = []
+        current = st
+        while current <= et:
+            dates.append(current)
+            current += timedelta(days=1)
 
         # 呼叫測站列表
         global station
 
+        # 初始化颱風警報爬蟲程式
         typhoon_fetcher = TyphoonWarningFetcher()
         typhoon_date_dict = typhoon_fetcher.fetch_all_warnings(
-            target_date.year, target_date.year
+            st.year, et.year
         )
 
+        # 初始化天氣資料爬蟲程式
         crawler = CODiSAPICrawler()
         all_data_list = []
 
-        for station in stations:
-            df = crawler.fetch_weather_data(station["station_id"], target_date)
-            if df is not None and not df.empty:
-                df["city_id"] = station["city_id"]
-                df["city_name"] = station["city_name"]
-                df["station_id"] = station["station_id"]
-                df["Altitude"] = station["Altitude"]
+        for date in dates:
+            print(f"正在抓取日期: {date}")
+            for station in stations:
+                df = crawler.fetch_weather_data(station["station_id"], date)
+                if df is not None and not df.empty:
+                    df["city_id"] = station["city_id"]
+                    df["city_name"] = station["city_name"]
+                    df["station_id"] = station["station_id"]
+                    df["Altitude"] = station["Altitude"]
 
-                date_str = target_date.strftime("%Y-%m-%d")
-                if date_str in typhoon_date_dict:
-                    df["is_typhoon"] = 1
-                    df["typhoon_name"] = ", ".join(typhoon_date_dict[date_str])
-                else:
-                    df["is_typhoon"] = 0
-                    df["typhoon_name"] = None
+                    date_str = date.strftime("%Y-%m-%d")
+                    if date_str in typhoon_date_dict:
+                        df["is_typhoon"] = 1
+                        df["typhoon_name"] = ", ".join(typhoon_date_dict[date_str])
+                    else:
+                        df["is_typhoon"] = 0
+                        df["typhoon_name"] = None
 
-                # 轉換為 dict (JSON serializable) 以便透過 XCom 傳遞
-                all_data_list.extend(df.to_dict(orient='records'))
+                    # 轉換為 dict (JSON serializable) 以便透過 XCom 傳遞
+                    all_data_list.extend(df.to_dict(orient='records'))
 
         if not all_data_list:
             print("今日無資料可抓取。")
@@ -973,6 +1004,22 @@ def weather_etl_dag_pymysql():
         
         # 欄位轉 snake_case
         daily_df.columns = daily_df.columns.map(camel_to_snake)
+
+        # 只擷取db裡有的欄位
+        db_columns = [
+            "date", 
+            "city_id", 
+            "altitude", 
+            "station_pressure", 
+            "air_temperature", 
+            "relative_humidity", 
+            "wind_speed", 
+            "precipitation", 
+            "is_typhoon", 
+            "typhoon_name"
+        ]
+        
+        daily_df = daily_df[db_columns]
 
         # MySQL看不懂Nan，故要將其轉為None
         daily_df = daily_df.replace({np.nan: None})
@@ -1024,7 +1071,7 @@ def weather_etl_dag_pymysql():
             # 使用 INSERT IGNORE 來避免重複主鍵錯誤
             sql = f"INSERT IGNORE INTO `{table}` ({cols_str}) VALUES ({placeholders})"
 
-            # 將dict轉換為tuple，
+            # 將dict轉換為tuple，才能被excutemany使用
             values = []
             for record in transformed_data:
                 values.append(tuple(record[c] for c in cols))
