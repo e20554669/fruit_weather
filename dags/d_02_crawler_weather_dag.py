@@ -1,5 +1,6 @@
 # 套件載入及抓取日期、因子的設定
 import pandas as pd
+import numpy as np
 import requests
 import json
 import warnings
@@ -903,6 +904,8 @@ def camel_to_snake(name):
 
 
 @dag(
+    dag_id="d_02_crawler_weather_dag",
+    description="每日抓取台灣各縣市天氣資料",
     schedule="0 6 * * *",
     start_date=pendulum.datetime(2020, 1, 1, tz="Asia/Taipei"),
     catchup=False,
@@ -911,9 +914,9 @@ def camel_to_snake(name):
 def weather_etl_dag_pymysql():
 
     @task
-    def extract_transform_load_weather():
-        print("開始執行氣象 ETL 任務 (PyMySQL 版)...")
-
+    def extract_weather_data():
+        """extract"""
+        print("--- [Task 1] Extract: 開始抓取氣象資料 ---")
         target_date = datetime.today().date() - timedelta(days=3)  # 設定3天避免API掛點
         print(f"目標日期: {target_date}")
 
@@ -926,7 +929,7 @@ def weather_etl_dag_pymysql():
         )
 
         crawler = CODiSAPICrawler()
-        all_data = []
+        all_data_list = []
 
         for station in stations:
             df = crawler.fetch_weather_data(station["station_id"], target_date)
@@ -944,21 +947,49 @@ def weather_etl_dag_pymysql():
                     df["is_typhoon"] = 0
                     df["typhoon_name"] = None
 
-                all_data.append(df)
+                # 轉換為 dict (JSON serializable) 以便透過 XCom 傳遞
+                all_data_list.extend(df.to_dict(orient='records'))
 
-        if not all_data:
+        if not all_data_list:
             print("今日無資料可抓取。")
-            return
+            return []
 
-        hourly_df = pd.concat(all_data, ignore_index=True)
-        print(f"抓取完成，共 {len(hourly_df)} 筆逐時資料。")
+        print(f"抓取完成，共 {len(all_data_list)} 筆逐時資料。")
+        return all_data_list # 回傳給下一個 Task
 
+    @task
+    def transform_weather_data(raw_data: list):
+        """transform"""
+        print("--- [Task 2] Transform: 開始處理資料 ---")
+        if not raw_data:
+            print("無資料可處理。")
+            return []
+
+        # 從 XCom (List of Dicts) 還原回 DataFrame
+        hourly_df = pd.DataFrame(raw_data)
+        
+        # 執行彙總邏輯
         daily_df = create_daily_summary(hourly_df)
+        
+        # 欄位轉 snake_case
         daily_df.columns = daily_df.columns.map(camel_to_snake)
+
+        # MySQL看不懂Nan，故要將其轉為None
+        daily_df = daily_df.replace({np.nan: None})
+        
         print(f"彙總完成，共 {len(daily_df)} 筆每日資料。")
+        
+        # 再次轉為 Dict List 回傳給 Load Task
+        return daily_df.to_dict(orient='records')
 
-        # 寫入 MySQL (使用 PyMySQL + executemany)
-
+    @task
+    def load_weather_data(transformed_data: list):
+        """load"""
+        print("--- [Task 3] Load: 開始寫入資料庫 ---")
+        if not transformed_data:
+            print("無資料可寫入。")
+            return
+        
         # mysql server
         host = "104.199.220.12"
         port = 3306
@@ -966,7 +997,7 @@ def weather_etl_dag_pymysql():
         passwd = "password"
         db = "tjr103-team02"
         charset = "utf8mb4"
-        table = "weather"  # 請確認表格名稱
+        table = "weather"
 
         conn = None
         cursor = None
@@ -984,21 +1015,19 @@ def weather_etl_dag_pymysql():
             cursor = conn.cursor()
             print("成功連線！")
 
-            # 1. 處理 NaN 問題 (Pandas NaN -> Python None)
-            # PyMySQL 不接受 NaN，這一步至關重要
-            daily_df = daily_df.where(pd.notna(daily_df), None)
-
-            # 2. 準備欄位名稱與 SQL 語法
-            # 動態產生 SQL 語法，確保 DataFrame 欄位順序與 SQL 一致
-            cols = list(daily_df.columns)
+            # 從 List of Dicts 準備寫入資料
+            first_record = transformed_data[0]  # 第一筆資料為欄位名稱
+            cols = list(first_record.keys()) # 取出欄位名稱
             cols_str = ", ".join([f"`{c}`" for c in cols])  # 加入反引號避免關鍵字衝突
-            placeholders = ", ".join(["%s"] * len(cols))
+            placeholders = ", ".join(["%s"] * len(cols))  # 依照欄位數目製作(%s, %s...) 
 
-            # 使用 INSERT IGNORE 來避免重複主鍵錯誤 (保持 Airflow 任務冪等性)
+            # 使用 INSERT IGNORE 來避免重複主鍵錯誤
             sql = f"INSERT IGNORE INTO `{table}` ({cols_str}) VALUES ({placeholders})"
 
-            # 3. 將 DataFrame 轉換為 Tuple 列表
-            values = [tuple(x) for x in daily_df.to_numpy()]
+            # 將dict轉換為tuple，
+            values = []
+            for record in transformed_data:
+                values.append(tuple(record[c] for c in cols))
 
             print(f"開始批次寫入 {len(values)} 筆資料...")
             cursor.executemany(sql, values)
@@ -1017,7 +1046,9 @@ def weather_etl_dag_pymysql():
             if conn:
                 conn.close()
 
-    extract_transform_load_weather()
-
+    # 設定相依性
+    raw_data = extract_weather_data()
+    clean_data = transform_weather_data(raw_data)
+    load_weather_data(clean_data)
 
 weather_etl_dag_pymysql()
