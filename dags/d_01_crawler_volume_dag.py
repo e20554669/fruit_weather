@@ -11,7 +11,7 @@ DB_CONFIG = {
     "port": 3306,
     "user": "tjr103-team02",
     "password": "password",
-    "database": "volume",
+    "database": "tjr103-team02",
     "charset": "utf8mb4"
 }
 
